@@ -818,13 +818,13 @@ class ADSMasterPipelineCelery(ADSCelery):
             entry = (rec, metrics, collections)
         return entry
 
-    def generate_boost_request_message(self, bibcode, run_id=None, output_path=None):
+    def generate_boost_request_message(self, bibcodes, run_id=None, output_path=None):
         """Build and send boost request message to Boost Pipeline.
         
         Parameters
         ----------
-        bibcode : str
-            Single bibcode to send.
+        bibcodes : list
+            List of bibcodes to send. Can be a single-item list for one bibcode.
         run_id : int, optional
             Optional job/run identifier added to each entry.
         output_path : str, optional
@@ -832,46 +832,120 @@ class ADSMasterPipelineCelery(ADSCelery):
 
         Returns
         -------
-        bool
-            True if message was sent successfully, False otherwise.
+        int
+            Number of bibcodes successfully processed.
         """
-
-        # Check if bibcode is provided
-        if not bibcode:
-            self.logger.warning('generate_boost_request_message called without bibcode')
-            return False
         
-        try:
-            # Get record data for this bibcode
-            (rec, metrics, classifications) = self._get_info_for_boost_entry(bibcode)
-            if not rec:
-                self.logger.debug('Skipping bibcode with no data: %s', bibcode)
-                return False
-                
-            # Create message for this record
-            message = self._populate_boost_request_from_record(rec, metrics, classifications, 
-                                                            run_id, output_path, None)
-                
-        except Exception as e:
-            self.logger.error('Error retrieving record data for bibcode %s: %s', bibcode, e)
-            self.logger.error('Message content: %s', message)
-            raise
+        if not self._config.get('OUTPUT_TASKNAME_BOOST'):
+            self.logger.warning('generate_boost_request_message called but no boost taskname in config')
+            return 0
+        if not self._config.get('OUTPUT_CELERY_BROKER_BOOST'):
+            self.logger.warning('generate_boost_request_message called but no boost broker in config')
+            return 0
 
-        output_taskname=self._config.get('OUTPUT_TASKNAME_BOOST')
-        output_broker=self._config.get('OUTPUT_CELERY_BROKER_BOOST')
-        self.logger.debug('output_taskname: {}'.format(output_taskname))
-        self.logger.debug('output_broker: {}'.format(output_broker))
-        self.logger.debug('sending message {}'.format(message))
+        # Normalize input to always be a list
+        if not bibcodes:
+            self.logger.warning('generate_boost_request_message called without bibcodes')
+            return 0
+        
+        if isinstance(bibcodes, str):
+            bibcodes = [bibcodes]
+        
+        if not isinstance(bibcodes, list):
+            self.logger.warning('generate_boost_request_message called with invalid bibcodes type: %s', type(bibcodes))
+            return 0
 
-        # Forward message to Boost Pipeline - Celery workers will handle the rest
-        try: 
-            self.forward_message(message, pipeline='boost')
-            self.logger.info('Sent boost request for bibcode %s to Boost Pipeline', bibcode)
-            return True
-            
-        except Exception as e:
-            self.logger.exception('Error sending boost request for bibcode %s: %s', bibcode, e)
-            return False
+        if not bibcodes:
+            self.logger.warning('No bibcodes to process')
+            return 0
+
+        self.logger.info('Processing %d bibcode(s) for boost request', len(bibcodes))
+        
+        message_list = []
+        
+        # Collect data for each bibcode
+        for bibcode in bibcodes:
+            if not bibcode:
+                continue
+                
+            try:
+                # Get record data for this bibcode
+                (rec, metrics, classifications) = self._get_info_for_boost_entry(bibcode)
+                if not rec:
+                    self.logger.debug('Skipping bibcode with no data: %s', bibcode)
+                    continue
+                
+                # Create message data for this record
+                message_data = self._populate_boost_request_from_record(
+                    rec, metrics, classifications, run_id, output_path, None
+                )
+                message_list.append(message_data)
+                
+            except Exception as e:
+                self.logger.error('Error retrieving record data for bibcode %s: %s', bibcode, e)
+                continue
+        
+        # Send message if we have any records
+        if len(message_list) > 0:
+            try:
+                # Create BoostRequestRecordList message
+                message = BoostRequestRecordList()
+                
+                # Add each record to the message
+                for item in message_list:
+                    entry = message.boost_requests.add()
+                    entry.bibcode = item.get('bibcode', '')
+                    entry.scix_id = item.get('scix_id', '')
+                    entry.status = item.get('status', 'updated')
+                    
+                    # Handle bib_data (can be string or dict)
+                    bib_data = item.get('bib_data', '')
+                    if isinstance(bib_data, dict):
+                        entry.bib_data = json.dumps(bib_data)
+                    else:
+                        entry.bib_data = bib_data if isinstance(bib_data, str) else str(bib_data)
+                    
+                    # Handle metrics (can be string or dict)
+                    metrics = item.get('metrics', '')
+                    if isinstance(metrics, dict):
+                        entry.metrics = json.dumps(metrics)
+                    else:
+                        entry.metrics = metrics if isinstance(metrics, str) else str(metrics)
+                    
+                    # Handle classifications (list)
+                    classifications = item.get('classifications', [])
+                    entry.classifications.extend(classifications if isinstance(classifications, list) else [])
+                    
+                    # Handle collections (list)
+                    collections = item.get('collections', [])
+                    entry.collections.extend(collections if isinstance(collections, list) else [])
+                    
+                    # Set optional fields
+                    if run_id is not None:
+                        entry.run_id = run_id
+                    if output_path:
+                        entry.output_path = output_path
+                    elif item.get('output_path'):
+                        entry.output_path = item.get('output_path')
+                
+                output_taskname = self._config.get('OUTPUT_TASKNAME_BOOST')
+                output_broker = self._config.get('OUTPUT_CELERY_BROKER_BOOST')
+                self.logger.debug('output_taskname: {}'.format(output_taskname))
+                self.logger.debug('output_broker: {}'.format(output_broker))
+                self.logger.debug('sending message {}'.format(message))
+                
+                # Forward message to Boost Pipeline - Celery workers will handle the rest
+                self.forward_message(message, pipeline='boost')
+                self.logger.info('Sent boost request for %d record(s) to Boost Pipeline', len(message_list))
+                
+                return len(message_list)
+                
+            except Exception as e:
+                self.logger.exception('Error sending boost request: %s', e)
+                return 0
+        else:
+            self.logger.warning('No valid records to send for boost request')
+            return 0
 
     def generate_links_for_resolver(self, record):
         """use nonbib or bib elements of database record and return links for resolver and checksum"""

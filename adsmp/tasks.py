@@ -1190,9 +1190,9 @@ def task_boost_request(bibcodes):
     # Normalize input to always be a list
     if isinstance(bibcodes, str):
         bibcodes = [bibcodes]
-        
-    for bibcode in bibcodes:
-        result = app.generate_boost_request_message(bibcode)
+    
+    # Pass the entire list to generate_boost_request_message for batch processing
+    result = app.generate_boost_request_message(bibcodes)
     
     logger.info('Boost requests for %s bibcode(s) sent to boost pipeline', len(bibcodes))
     
