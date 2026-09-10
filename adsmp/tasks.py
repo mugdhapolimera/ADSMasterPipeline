@@ -182,6 +182,41 @@ def task_update_record(msg):
             if record:
                 logger.debug('Saved classify message: %s', msg)
                 _generate_boost_request(msg, type)
+        elif type == 'boost_responses':
+            # Boost Pipeline answers a batched request with a list; store each
+            # response the same way a single 'boost' message is stored. A record
+            # that fails must not take the rest of the batch with it, so failures
+            # are logged and skipped rather than aborting the loop.
+            retry_queue = []
+            for m in msg.boost_responses:
+                m = Msg(m, None, None)
+                bibcodes.append(m.bibcode)
+                try:
+                    record = app.update_storage(m.bibcode, 'boost',
+                                                m.toJSON(including_default_value_fields=True))
+                    if record:
+                        logger.debug('Saved boost record from list: %s', record)
+                except Exception as e:
+                    logger.exception('Error saving boost record for bibcode %s: %s',
+                                     m.bibcode, e)
+                    retry_queue.append(m)
+
+            # Retry the failures once; most are transient and a second attempt is
+            # cheaper than losing the record until the next full boost run.
+            failed = 0
+            if retry_queue:
+                logger.info('Retrying %d failed boost record(s)', len(retry_queue))
+                for m in retry_queue:
+                    try:
+                        app.update_storage(m.bibcode, 'boost',
+                                           m.toJSON(including_default_value_fields=True))
+                    except Exception as e:
+                        failed += 1
+                        logger.error('Boost record failed on retry for %s: %s',
+                                     m.bibcode, e)
+            if failed:
+                logger.error('Failed to save %d of %d boost record(s) in batch',
+                             failed, len(msg.boost_responses))
         else:
             # here when record has a single bibcode
             bibcodes.append(msg.bibcode)
